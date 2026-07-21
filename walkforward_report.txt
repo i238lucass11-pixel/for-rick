@@ -1,0 +1,28 @@
+======================================================================
+VALIDATION REPORT — IS/OOS BACKTEST
+======================================================================
+
+IS→OOS cutoff date: 2015-12-02
+Config: inverse-vol across sleeves (capped)  VIX-gate=ON  leverage=OFF  reindex=True
+Vol estimator: ewma  rebalance=126d uniform  excluded sleeves=['DEFENSIVE_QUALITY']
+
+METRICS PER PERIOD:
+  IS  : CAGR  10.07%  Sharpe 2.52  Vol  3.83%  MaxDD  -2.24%  Calmar 4.49  (239 days)
+  OOS : CAGR   8.72%  Sharpe 1.12  Vol  7.75%  MaxDD -18.86%  Calmar 0.46  (2994 days)
+  OOS-mix: CAGR  16.68%  Sharpe 2.53  Vol  6.17%  MaxDD  -8.55%  Calmar 1.95  (2774 days)
+  ALL : CAGR  16.12%  Sharpe 2.51  Vol  6.02%  MaxDD  -8.55%  Calmar 1.88  (3013 days)
+
+PURE OOS (all tickers in OOS, from 2025-08-14):
+  PURE: CAGR   8.03%  Sharpe 1.18  Vol  6.10%  MaxDD  -3.52%  Calmar 2.28  (243 days)
+  ↑ Most honest reading: COMPLETE portfolio, out of sample.
+    Shorter → noisier, but no composition mixing.
+
+INTERPRETATION:
+  Sharpe gap (IS - OOS): +1.41
+  CAGR gap   (IS - OOS): +1.35pp
+  ⚠️  IS is FAR above OOS → the strategies were substantially
+     overfit. The OOS is your realistic expectation.
+
+  Note: IS ALWAYS looks better or equal by construction (Optuna
+  optimized there). What validates robustness is that the OOS
+  does not collapse. A solid OOS with a small gap is the ideal.

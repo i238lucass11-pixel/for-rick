@@ -1,0 +1,178 @@
+# Quant Trend-Following Pipeline — Review Package
+
+Author: Lucas
+Date: 2026-07-21
+
+Systematic multi-asset trend-following pipeline (stocks, ETFs, forex,
+commodities, crypto): strategy mining, per-ticker ensembling, portfolio
+balancing with real costs, and three-layer validation.
+
+**Start with `Pipeline_Quant.ipynb`** — it orchestrates the whole pipeline
+step by step, documents every requested change, and renders the tables and
+charts.
+
+---
+
+## Headline results (official portfolio, with costs)
+
+OOS period 2016-05 → 2026-07 (10.4 years), $10,000 starting capital:
+
+| Metric | Value |
+|---|---|
+| CAGR | 7.03% |
+| Sharpe | 1.03 |
+| Annualized vol | 6.85% |
+| MaxDD | -12.09% |
+| Calmar | 0.58 |
+
+Validation (on the pure OOS matrix, complete universe from 2019):
+
+- **Walk-forward** (12 rolling 2-year windows, 6-month step): mean Sharpe
+  1.30, 11/12 windows positive. One negative window (Sharpe -0.26).
+- **Monte Carlo** (2000 block-bootstrap simulations, 21-day blocks): the
+  realized result falls at the 51st percentile of alternative histories
+  (exactly the median — no evidence of sequence luck). MaxDD of the worst
+  5% of histories: -15.2% (the number to plan risk around).
+- **IS/OOS**: IS→OOS Sharpe gap of +1.41 (mining-stage overfitting,
+  expected by construction; the OOS is the realistic expectation and does
+  not collapse).
+
+See chart: `results/portfolio_equity_chart.png`
+
+---
+
+## Pipeline architecture (4 stages)
+
+```
+Quant_Miner.py           mines strategies per ticker (Optuna + vectorbt),
+       │                 per-ticker 60/40 IS/OOS split, raw CSV cache.
+       │                 Subcommand `py Quant_Miner.py reseleccionar`
+       │                 re-selects the per-ticker top-3 using ONLY IS
+       │                 metrics (sleeve-adapted Sharpe thresholds, dedup
+       │                 by indicator family + IS correlation) and fully
+       │                 regenerates the long-format return files.
+       ▼
+Strategy_Assembler.py    per-ticker ensemble (rolling inverse-vol over the
+       │                 top-3), cross-indicator dedup, dead-weight pruning
+       │                 by IS Sharpe (not OOS — avoids covert selection).
+       ▼
+Portfolio_Balancer.py    hierarchical allocation: inverse-vol ACROSS
+       │                 sleeves (Ledoit-Wolf shrunk covariance, hard caps)
+       │                 × diversification score WITHIN sleeves; broker-
+       │                 differentiated costs, historical CFD forex swaps,
+       │                 VIX de-risk gate.
+       ▼
+validation.py            3 layers: IS/OOS, walk-forward, Monte Carlo.
+```
+
+Support modules: `broker_config.py` (Hapi/Vantage/Binance cost model),
+`forex_swap.py` (historical policy-rate-differential forex swap),
+`asset_group_config.py` (dates/fees/frequency per asset class),
+`precios_cache.py` (local on-disk yfinance price cache),
+`sleeve_map.json` / `sector_map.json` (ticker classification),
+`verificar_entorno.py` (environment check),
+`generar_chart.py` (regenerates the equity/drawdown/sleeve chart).
+
+Note: `Quant_Miner.py` is documented in Spanish (working language of the
+mining stage); the rest of the pipeline, all reports and all outputs are
+in English.
+
+---
+
+## Core methodological principle
+
+**Strict separation of selection and validation:** every selection decision
+(filters, scores, dedup, pruning) uses IS metrics exclusively. The OOS is
+touched once, to validate. This required a full leakage audit that fixed:
+Assembler pruning that used OOS Sharpe, uniform thresholds that biased by
+asset class, and indicator-family duplicates.
+
+## Recent improvements (July 2026)
+
+- **Volatility scaling disabled** (professor feedback): removed the per-ticker vol-scaling
+  of parameter search ranges that biased the candidate pool. Optuna now searches the
+  base ranges for all tickers uniformly. Result: CAGR improved from 6.59% to 7.03%
+  with half the trials (700 vs 1250), and walk-forward Sharpe distribution tightened
+  (std 0.77 → more robust), confirming the prior scaling was selecting overfitted
+  strategies.
+- **Sensitivity battery cap** (cost optimization): limited sensitivity analysis to top-60
+  candidates per indicator (from all). No material change to final selection (top-3 per
+  ticker is constrained by re-selection) but reduced per-ticker mining time from 5h to
+  ~30min for dense asset classes.
+- **Aduana (selection gate) bug fix** (vectorbt 1.0 compatibility): profit_factor and
+  win_rate were silently returning NaN for all strategies (records.dtype.names check
+  failed on DataFrame records). Fixed with generic column accessor. This recovered
+  hundreds of valid strategies per ticker that were being rejected.
+
+## Configuration decisions (each backed by a sweep on the full universe)
+
+| Decision | Evidence |
+|---|---|
+| Inverse-vol across sleeves (with caps) | Equal-weight sleeves: Sharpe 0.69, MaxDD -19.6% (much worse). Risk-budget/return-tilted variants also worse — removed from the code. |
+| No inverse-vol within sleeves | Within a sleeve, residual vol is largely trend signal; removing the term adds ~0.7pp CAGR at equal Sharpe. |
+| GROWTH_BETA cap 80% (was 40%) | Monotone improvement 40→80%, saturates at 80%. |
+| DIVERSIFIERS cap 30% (was uncapped) | Uncapped, inverse-vol pushed ~50% into the lowest-vol sleeve. |
+| VIX de-risk gate ON | Isolated: -2.3pp MaxDD, +Sharpe/+Calmar, CAGR unchanged. |
+| Leverage OFF (`MAX_LEVERAGE = 1.0`) | 1.15x/1.30x/1.50x all degrade CAGR, Sharpe and MaxDD monotonically (5% borrow + procyclical timing). The machinery is kept in the code as a documented knob. |
+| DEFENSIVE_QUALITY sleeve excluded | 48-config sweep: every config without it beats its 5-sleeve equivalent. |
+
+Known caveat — CRYPTO decay: 81% of crypto tickers have negative Sharpe in
+the held-out last-12-months window (vs 3-36% for the other sleeves; the
+worsening from the prior 73% suggests continued erosion of daily-trend edge
+in the sleeve, not a one-off). Inverse-vol already underweights the sleeve
+relative to its raw vol, though it still carries 12.8% of the book at the
+last rebalance — a name worth revisiting (see improvement ideas below).
+
+---
+
+## Package contents
+
+Everything lives in ONE flat folder so `Pipeline_Quant.ipynb` and every
+script run in place with no path setup.
+
+```
+Pipeline_Quant.ipynb       — START HERE: orchestrates the whole pipeline
+                             step by step and renders tables and charts
+*.py, *.json               — the full pipeline (10 modules + 2 maps)
+top3_global.csv            — 615 selected strategies / 281 tickers
+oos_returns_long.parquet   — per-strategy OOS returns   (Assembler input)
+equity_curves_long.parquet — per-strategy equity curves (Assembler input)
+ensemble_per_ticker.csv    — 278 post-pruning ensembles
+ensemble_returns_long.parquet / ensemble_returns_isoos.parquet
+portfolio_weights.csv      — final per-ticker weights
+portfolio_equity.parquet / sleeve_equity_curves.parquet
+results/                   — pre-generated reports + chart:
+                             portfolio_report.txt, assembler_report.txt,
+                             validation_isoos_report.txt,
+                             walkforward_report.txt + walkforward.csv,
+                             montecarlo_report.txt + montecarlo.csv,
+                             portfolio_equity_chart.png
+```
+
+**Runnable out of the box:** Strategy_Assembler.py, Portfolio_Balancer.py
+and validation.py (stages 2-4) — i.e. everything in the notebook except the
+mining cell. **Not included (size):** the mined-strategy raw cache
+(`estrategias_por_ticker/`, ~324k strategies) needed to re-run the mining
+or the re-selection — available on request.
+
+---
+
+## How to run
+
+Requirements: Python 3.10-3.13 (vectorbt CI matrix; 3.14 works but numba
+support is not guaranteed) and `pip install -r requirements.txt`.
+
+```
+py verificar_entorno.py        # dependency and file check
+
+# Recommended: open Pipeline_Quant.ipynb and run it top to bottom
+# (skip the mining cell). Or from the terminal:
+py Strategy_Assembler.py       # rebuilds ensembles from the included inputs
+py Portfolio_Balancer.py       # regenerates portfolio_report.txt + weights
+py validation.py               # IS/OOS + walk-forward + Monte Carlo (~5 min)
+py generar_chart.py            # regenerates results/portfolio_equity_chart.png
+```
+
+Note: Portfolio_Balancer and validation download SPY/VIX/HYG/LQD from
+yfinance for the regime signal (falls back to neutral without internet).
+`precios_cache.py` caches prices on disk for later runs.

@@ -1,0 +1,226 @@
+"""
+broker_config.py
+=================
+
+Classifies every ticker in the universe to a real execution broker
+(Hapi, Vantage, Binance) and defines the corresponding cost model.
+
+WHY THIS EXISTS:
+  The previous model (a flat COST_BPS per asset_group in
+  Portfolio_Balancer.py) charged bps only on rebalance days (turnover).
+  That is correct for spread-only brokers (Hapi, Binance), but it badly
+  UNDERESTIMATES the real cost at Vantage (CFD), where the dominant cost
+  is the swap/financing charged EVERY NIGHT the position stays open, not
+  only when it turns over.
+
+  This module splits cost into two components:
+    1. cost_bps_turnover  → entry/exit cost (spread), charged on the
+                            rebalance day over Σ|Δw|.
+    2. swap_annual_rate   → holding cost (financing), charged EVERY DAY
+                            over the position's current weight, prorated
+                            daily.
+
+BROKER STACK:
+  - Hapi:    real stocks/ETFs, funded via USDT. No swap (real position).
+  - Vantage: CFD for forex, commodities, and any equity Hapi doesn't cover
+             (under the INCLUDE_NON_HAPI_AS_CFD flag). 825 stock CFDs +
+             57 ETF CFDs available — reasonable fallback coverage.
+  - Binance: real crypto spot. No swap.
+
+DISCARDED — swap-free accounts (Vantage / VT Markets / Pepperstone):
+  Evaluated and discarded for this pipeline. Pepperstone publishes its
+  official fee schedule: the swap-free account charges no daily swap, but
+  charges an "Administration Fee" of $100 USD PER LOT every 5 days the
+  position stays open (source: Pepperstone Costs & Charges, Feb 2026).
+  For a typical 63-day holding (GROWTH_BETA/DIVERSIFIERS) that is ~12.6
+  five-day cycles → ~$1,260 USD per lot, far above the estimated normal
+  swap (~$75-150 per lot over the same period). Swap-free accounts are
+  designed for short holdings (days), not multi-week trend-following.
+  Vantage and VT Markets likely have an analogous admin-fee structure
+  (unconfirmed — same industry pattern); not worth pursuing unless the
+  pipeline moves to much more frequent rebalancing.
+
+RATE STATUS (2026-07-05):
+  The Vantage swap_annual rates are still third-party ESTIMATES, not
+  official Vantage data. We do have an anchor from a direct competitor
+  (Pepperstone, official, Costs & Charges PDF Feb 2026):
+    - Forex majors/minors: varies by pair and direction (long/short are
+      ASYMMETRIC). Real example AUDCAD: long ≈ 1.75%/yr, short ≈ 0.31%
+      (credit). This validates that our generic 2% for FOREX is not far
+      off for majors; exotics are another story.
+    - Crypto CFD (reference only — we use Binance spot): long 22.5%/yr,
+      short 7.5%/yr. Far more expensive than spot — confirms the decision
+      to use Binance for crypto.
+    - Commodities: contango/backwardation formula + 2.5% fixed, not a
+      single annual % — varies per commodity and contract month.
+  To replace the estimate with real VANTAGE data:
+    1. Open a Vantage demo account (free).
+    2. MT4/MT5 → right-click the symbol → "Specification".
+    3. Note Swap Long / Swap Short (asymmetric — do not average).
+    4. Enter them in VANTAGE_SWAP_OVERRIDES below, per ticker.
+"""
+
+from dataclasses import dataclass
+
+
+# =============================================================================
+# UNIVERSE COVERED BY HAPI
+# =============================================================================
+# Hapi offers >9000 NYSE/NASDAQ stocks/ETFs. In practice nearly all of
+# GROWTH_BETA and DEFENSIVE_QUALITY qualifies. This list holds KNOWN
+# EXCLUSIONS (odd ADRs, very small or foreign ETFs) — cheaper to maintain
+# than a 200+ ticker whitelist.
+#
+# Confirmed fallback: if a ticker lands here and INCLUDE_NON_HAPI_AS_CFD=True
+# is set, it routes to Vantage as an equity CFD.
+HAPI_EXCLUSIONS = {
+    'FANUY',   # Fanuc, Japanese OTC ADR — CONFIRMED absent from Hapi (2026-07)
+    # Verified in the actual Hapi app (2026-07): BABA, JD, PDD, BIDU, NIO,
+    # SNSR, TRFK, UFO, EBIZ, MILN, XSMO, AGNG, PRNT, AIRR, BIZD, WTV ARE
+    # available — they do not belong here. The initial suspicion (Chinese
+    # ADRs and boutique ETFs as likely gaps) proved mostly wrong; Hapi's
+    # catalog is broader than assumed.
+}
+
+# Tickers that by definition are NEVER on Hapi (not a real stock/ETF)
+NON_EQUITY_SUFFIXES = ('-USD', '=X', '=F')
+
+
+# =============================================================================
+# DIAGNOSTIC: isolate the swap effect (temporary, for cause comparison)
+# =============================================================================
+# When True, Vantage swap is zeroed but turnover/spread stays active — lets
+# you run validation.py twice (True/False) and compare the SAME walk-forward
+# window with and without swap, to confirm whether the daily drag actually
+# flips the sign of a specific window instead of assuming it.
+# Set back to False once the comparison is done.
+DIAGNOSTIC_DISABLE_SWAP = False
+
+# =============================================================================
+# SWAP RATES — VANTAGE (placeholders, see module docstring)
+# =============================================================================
+# Annual rates per category, applied to the position's weight (%), prorated
+# daily (/365). Source: third-party estimates, anchored against official
+# Pepperstone data (direct competitor, same CFD structure) where possible.
+VANTAGE_SWAP_ANNUAL_DEFAULT = {
+    'EQUITY_CFD':    0.06,   # stocks/ETFs via CFD (Hapi-excluded or forced)
+    'FOREX':         0.02,   # majors/minors; anchored to the Pepperstone
+                             # AUDCAD long ≈1.75%/yr example — consistent
+    'COMMODITIES':   0.06,   # metals/energy CFD; Pepperstone uses a
+                             # contango/backwardation formula, not a fixed %
+                             # — this remains a rough approximation
+}
+
+# Per-ticker overrides once real MT4/MT5 data from Vantage is available.
+# Format: {'EURUSD=X': 0.018, 'GC=F': 0.045, ...}
+VANTAGE_SWAP_OVERRIDES = {
+    # fill with real Specification data from MT4/MT5 (Vantage)
+}
+
+# Entry/exit spread/commission at Vantage (bps over turnover) — kept from the
+# previous COST_BPS model; this part IS reasonably well calibrated (spreads
+# are public and stable).
+VANTAGE_TURNOVER_BPS = {
+    'FOREX':       1.5,
+    'COMMODITIES': 8.0,
+    'EQUITY_CFD':  5.0,   # stock CFD: spread similar to the share, no broker commission
+}
+
+# --- Hapi: turnover only (clearing fee), no swap (real position) ---
+# $0.10/whole share, $0.15/fraction → approximated to bps over the average
+# position notional (assuming a typical ticket ~1-2% of capital).
+# This is an approximation; Hapi's real cost is *fixed per trade*, not
+# proportional to size, so it overestimates cost for large accounts and
+# underestimates it for small ones.
+HAPI_CLEARING_FEE_USD = 0.125       # average of whole (0.10) and fraction (0.15)
+HAPI_TURNOVER_BPS_APPROX = 3.0      # bps-equivalent fallback, same order as before
+
+# --- Binance: unchanged from the previous model ---
+BINANCE_TURNOVER_BPS = 15.0
+
+
+# =============================================================================
+# CLASSIFICATION ticker -> broker
+# =============================================================================
+
+@dataclass(frozen=True)
+class CostModel:
+    broker: str
+    turnover_bps: float     # charged over |Δw| on the rebalance day
+    swap_annual: float      # charged daily over the current weight (0 = no swap)
+
+
+def _is_non_equity(ticker: str) -> bool:
+    return ticker.endswith(NON_EQUITY_SUFFIXES)
+
+
+def classify_ticker(ticker: str, asset_group: str,
+                     include_non_hapi_as_cfd: bool) -> CostModel:
+    """
+    Decides a ticker's broker and cost model.
+
+    Rules:
+      1. Crypto (-USD)      -> Binance, real spot, no swap.
+      2. Forex (=X)         -> Vantage CFD (no real alternative).
+      3. Futures (=F)       -> Vantage CFD (commodities).
+      4. Rest (stocks/ETF)  -> Hapi unless in HAPI_EXCLUSIONS.
+                                If excluded:
+                                  - include_non_hapi_as_cfd=False -> broker
+                                    'EXCLUDED' (drops out of the universe).
+                                  - include_non_hapi_as_cfd=True  -> Vantage
+                                    equity CFD.
+    """
+    if ticker.endswith('-USD'):
+        return CostModel('BINANCE', BINANCE_TURNOVER_BPS, 0.0)
+
+    if ticker.endswith('=X'):
+        rate = 0.0 if DIAGNOSTIC_DISABLE_SWAP else \
+            VANTAGE_SWAP_OVERRIDES.get(ticker, VANTAGE_SWAP_ANNUAL_DEFAULT['FOREX'])
+        return CostModel('VANTAGE', VANTAGE_TURNOVER_BPS['FOREX'], rate)
+
+    if ticker.endswith('=F'):
+        rate = 0.0 if DIAGNOSTIC_DISABLE_SWAP else \
+            VANTAGE_SWAP_OVERRIDES.get(ticker, VANTAGE_SWAP_ANNUAL_DEFAULT['COMMODITIES'])
+        return CostModel('VANTAGE', VANTAGE_TURNOVER_BPS['COMMODITIES'], rate)
+
+    # Stock / ETF
+    if ticker not in HAPI_EXCLUSIONS:
+        return CostModel('HAPI', HAPI_TURNOVER_BPS_APPROX, 0.0)
+
+    if include_non_hapi_as_cfd:
+        rate = 0.0 if DIAGNOSTIC_DISABLE_SWAP else \
+            VANTAGE_SWAP_OVERRIDES.get(ticker, VANTAGE_SWAP_ANNUAL_DEFAULT['EQUITY_CFD'])
+        return CostModel('VANTAGE', VANTAGE_TURNOVER_BPS['EQUITY_CFD'], rate)
+
+    return CostModel('EXCLUDED', 0.0, 0.0)
+
+
+def build_broker_map(tickers, asset_group_of: dict,
+                      include_non_hapi_as_cfd: bool = False) -> dict:
+    """
+    Builds {ticker: CostModel} for the whole universe.
+
+    Args:
+        tickers: iterable of tickers to classify.
+        asset_group_of: dict ticker -> asset_group (from ensemble_per_ticker.csv).
+        include_non_hapi_as_cfd: if True, Hapi-excluded tickers route to
+            Vantage as CFDs instead of dropping out of the universe. Run the
+            pipeline once with False and once with True to compare impact.
+    """
+    return {
+        t: classify_ticker(t, asset_group_of.get(t, ''), include_non_hapi_as_cfd)
+        for t in tickers
+    }
+
+
+def excluded_tickers(broker_map: dict) -> list:
+    """Tickers that drop out of the universe under the current scenario."""
+    return sorted(t for t, cm in broker_map.items() if cm.broker == 'EXCLUDED')
+
+
+def broker_summary(broker_map: dict) -> dict:
+    """Ticker count per broker, for the report."""
+    out = {}
+    for cm in broker_map.values():
+        out[cm.broker] = out.get(cm.broker, 0) + 1
+    return out

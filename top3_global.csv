@@ -1,0 +1,695 @@
+"""
+Strategy_Assembler.py  (v2.1)
+==============================
+Builds a per-ticker strategy ensemble from the Enricher's output and computes
+the metrics used by Portfolio_Balancer.py to allocate across tickers.
+
+HOW IT WORKS
+------------
+For each ticker in top3_global.csv:
+
+  1. Retrieves the daily OOS returns for all its selected strategies.
+  2. Deduplicates: drops strategies whose returns correlate > DEDUP_CORR with a
+     higher-scoring strategy (cross-indicator redundancy filter).
+  3. Combines the remaining strategies into a single return series using rolling
+     inverse-vol weights (recalculated every REBAL_FREQ days, LOOKBACK window).
+     Equal weights during warmup. No look-ahead: weights use only past data.
+  4. Computes ensemble performance metrics (Sharpe, CAGR, MaxDD, Sortino,
+     monthly_consistency, tail_ratio) and a held-out validation period (last
+     VAL_DIAS trading days) with the same metrics.
+  5. Computes diversification_score and ensemble_benefit_ratio so the Portfolio
+     Balancer can down-weight fragile single-strategy ensembles.
+
+DESIGN PRINCIPLE — Separation of Selection and Validation
+---------------------------------------------------------
+The Assembler SELECTS strategies (rolling weights based on historical Sharpe).
+Validation is performed separately by validacion.py. Mixing the two would turn
+the robustness test into another round of optimization (overfitting).
+
+INPUTS
+------
+    top3_global.csv              — Enricher output: one row per strategy,
+                                   columns: strategy_id, ticker, asset_group,
+                                   indicator, params, side, selection_score
+    oos_returns_long.*           — long-format daily returns (strategy_id × date)
+    sleeve_map.json              — maps tickers to portfolio sleeves
+
+OUTPUTS
+-------
+    ensemble_per_ticker.csv      — one row per ticker with all metrics
+    ensemble_returns_long.*      — (ticker, date, return) assembled daily returns
+    ensemble_equity_curves.*     — (ticker, date, equity) per-ticker equity curves
+    assembler_report.txt         — human-readable summary
+
+Run: py Strategy_Assembler.py
+     Next step: py Portfolio_Balancer.py
+"""
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# SECTION 1 — FILE PATHS
+# =============================================================================
+
+INPUT_STRATEGIES = 'top3_global.csv'
+INPUT_RETURNS    = 'oos_returns_long'    # no extension (auto-detects parquet/csv)
+SLEEVE_MAP       = 'sleeve_map.json'
+
+OUTPUT_ENSEMBLE  = 'ensemble_per_ticker.csv'
+OUTPUT_RETURNS   = 'ensemble_returns_long'
+OUTPUT_EQUITY    = 'ensemble_equity_curves'
+OUTPUT_REPORT    = 'assembler_report.txt'
+
+
+# =============================================================================
+# SECTION 2 — PARAMETERS
+# =============================================================================
+
+INIT_CASH       = 10_000
+WEIGHTING       = 'inv_vol'   # 'equal' | 'inv_vol' | 'inv_corr'
+MIN_STRATEGIES  = 1           # allow single-strategy ensembles (flagged in report)
+REBAL_FREQ      = 63          # recompute weights every ~3 months
+LOOKBACK        = 126         # rolling window for weight computation (~6 months)
+DEDUP_CORR      = 0.90        # correlation threshold for cross-indicator dedup
+VAL_DAYS        = 252         # held-out validation period (last ~1 year)
+
+# Dead-weight pruning: drop tickers whose ensemble OOS Sharpe is below this
+# threshold. Applied here (not in the balancer) so downstream files only
+# contain tickers worth allocating. PRUNE_KEEP_MIN prevents any sleeve from
+# being left empty.
+PRUNE_SHARPE_MIN = 0.40
+PRUNE_KEEP_MIN   = 2
+
+try:
+    import pyarrow  # noqa: F401
+    FORMAT = 'parquet'
+except ImportError:
+    FORMAT = 'csv'
+
+# Annualization frequency by asset group.
+# Uses asset_group_config.py if available (same source as the Enricher),
+# falling back to reasonable defaults otherwise.
+_FREQ_FALLBACK = {
+    'CRYPTO': 365, 'STOCKS': 252, 'STOCKS_ETF': 252,
+    'FOREX': 252, 'COMMODITIES': 252, 'DEFENSIVO': 252,
+}
+try:
+    from asset_group_config import get_config_for_group
+    def annual_freq(group):
+        try:
+            return float(get_config_for_group(group).freq_anual)
+        except Exception:
+            return _FREQ_FALLBACK.get(group, 252)
+except Exception:
+    def annual_freq(group):
+        return _FREQ_FALLBACK.get(group, 252)
+
+
+# =============================================================================
+# SECTION 3 — PERFORMANCE METRICS
+# =============================================================================
+
+def sharpe_ratio(returns, freq):
+    """Annualized Sharpe ratio. Returns 0 if fewer than 20 observations."""
+    r = returns.dropna()
+    if len(r) < 20 or r.std() == 0:
+        return 0.0
+    return float(r.mean() / r.std() * np.sqrt(freq))
+
+
+def sortino_ratio(returns, freq):
+    """Annualized Sortino ratio (downside deviation only)."""
+    r = returns.dropna()
+    downside = r[r < 0]
+    if len(r) < 20 or downside.std() == 0 or np.isnan(downside.std()):
+        return 0.0
+    return float(r.mean() / downside.std() * np.sqrt(freq))
+
+
+def cagr(equity, freq):
+    """Compound annual growth rate from an equity curve."""
+    if len(equity) < 2 or equity.iloc[0] <= 0:
+        return 0.0
+    years = len(equity) / freq
+    return float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1) if years > 0 else 0.0
+
+
+def max_drawdown(equity):
+    """Maximum peak-to-trough drawdown (returns a negative number)."""
+    if len(equity) < 2:
+        return 0.0
+    peak = equity.cummax()
+    return float(((equity - peak) / peak).min())
+
+
+def monthly_consistency(returns):
+    """
+    Fraction of calendar months with positive returns.
+    Groups by year+month to avoid deprecated 'M' offset across pandas versions.
+    """
+    r = returns.dropna()
+    if len(r) < 20:
+        return 0.0
+    monthly = (1 + r).groupby([r.index.year, r.index.month]).prod() - 1
+    return float((monthly > 0).mean()) if len(monthly) else 0.0
+
+
+def tail_ratio(returns):
+    """Ratio of the 95th to the absolute 5th percentile of daily returns."""
+    r = returns.dropna()
+    if len(r) < 20:
+        return 1.0
+    p95, p05 = np.percentile(r, 95), np.percentile(r, 5)
+    return float(abs(p95 / p05)) if p05 != 0 else 1.0
+
+
+def equity_curve(returns):
+    """Cumulative equity curve starting at INIT_CASH."""
+    return INIT_CASH * (1 + returns.fillna(0)).cumprod()
+
+
+# =============================================================================
+# SECTION 4 — WEIGHTING SCHEMES
+# =============================================================================
+
+def weights_equal(window):
+    """Uniform weights across all strategies."""
+    n = window.shape[1]
+    return np.ones(n) / n
+
+
+def weights_inv_vol(window):
+    """
+    Inverse-volatility weights: lower-vol strategies receive higher weight.
+    Falls back to equal weights if all volatilities are zero or NaN.
+    """
+    vol = window.std().values
+    vol = np.where(vol <= 0, np.nan, vol)
+    inv = 1 / vol
+    if np.all(np.isnan(inv)):
+        return weights_equal(window)
+    inv = np.nan_to_num(inv, nan=np.nanmin(inv))
+    return inv / inv.sum()
+
+
+def weights_inv_corr(window):
+    """
+    Inverse-vol weighted by decorrelation: strategies with lower average
+    correlation to others receive a higher multiplier. Encourages diversity.
+    """
+    n = window.shape[1]
+    if n < 2:
+        return np.ones(n)
+    corr = window.corr().values.copy()
+    np.fill_diagonal(corr, np.nan)
+    avg_corr = np.nanmean(np.abs(corr), axis=1)
+    avg_corr = np.nan_to_num(avg_corr, nan=0.5)
+    diversity = (1 - avg_corr)
+    w = weights_inv_vol(window) * np.clip(diversity, 0.05, None)
+    return w / w.sum()
+
+
+_WEIGHT_FN = {
+    'equal':    weights_equal,
+    'inv_vol':  weights_inv_vol,
+    'inv_corr': weights_inv_corr,
+}
+
+
+# =============================================================================
+# SECTION 5 — ROLLING ENSEMBLE CONSTRUCTION
+# =============================================================================
+
+def rolling_ensemble(matrix, weight_fn, rebal_freq, lookback):
+    """
+    Builds an ensemble return series with rolling weights. No look-ahead:
+    weights computed from matrix.iloc[i-lookback:i] are applied to day i.
+
+    Parameters
+    ----------
+    matrix      : DataFrame (days × strategies), daily returns
+    weight_fn   : one of the weight functions above
+    rebal_freq  : recompute weights every this many days
+    lookback    : rolling window length for weight computation
+
+    Returns
+    -------
+    ensemble    : Series of daily ensemble returns
+    info        : dict with rebalance count and final strategy weights
+    """
+    n_days, n_strats = matrix.shape
+    if n_strats == 1:
+        return (matrix.iloc[:, 0].copy(),
+                {'n_rebalances': 0, 'final_weights': {matrix.columns[0]: 1.0}})
+
+    ensemble = pd.Series(0.0, index=matrix.index)
+    weights  = np.ones(n_strats) / n_strats   # equal weights during warmup
+    n_rebal  = 0
+    values   = matrix.values
+
+    for i in range(n_days):
+        ensemble.iloc[i] = float(np.dot(values[i], weights))
+        if i >= lookback and (i - lookback) % rebal_freq == 0:
+            window = matrix.iloc[i - lookback:i]
+            if len(window) >= 20 and window.std().min() > 0:
+                try:
+                    new_w = weight_fn(window)
+                    if not np.any(np.isnan(new_w)) and np.all(new_w >= 0) and new_w.sum() > 0:
+                        weights = new_w / new_w.sum()
+                        n_rebal += 1
+                except Exception:
+                    pass
+
+    return (ensemble,
+            {'n_rebalances': n_rebal,
+             'final_weights': {c: round(float(x), 4)
+                               for c, x in zip(matrix.columns, weights)}})
+
+
+# =============================================================================
+# SECTION 6 — CROSS-INDICATOR DEDUPLICATION
+# =============================================================================
+
+def deduplicate_strategies(matrix, score_map, threshold):
+    """
+    Removes redundant strategies: if two strategies have correlation > threshold,
+    the one with the lower selection_score is dropped. Keeps strategies that
+    contribute unique information to the ensemble.
+
+    Returns (deduplicated_matrix, list_of_eliminated_pairs).
+    """
+    if matrix.shape[1] <= 1:
+        return matrix, []
+    corr = matrix.corr()
+    cols = list(matrix.columns)
+    dropped, eliminated = set(), []
+    for a in range(len(cols)):
+        if cols[a] in dropped:
+            continue
+        for b in range(a + 1, len(cols)):
+            if cols[b] in dropped:
+                continue
+            c = corr.iloc[a, b]
+            if not np.isnan(c) and c > threshold:
+                loser = (cols[b] if score_map.get(cols[a], 0) >= score_map.get(cols[b], 0)
+                         else cols[a])
+                dropped.add(loser)
+                eliminated.append((cols[a], cols[b], round(float(c), 3), loser))
+    if dropped:
+        matrix = matrix.drop(columns=list(dropped))
+    return matrix, eliminated
+
+
+# =============================================================================
+# SECTION 7 — I/O HELPERS
+# =============================================================================
+
+def load_returns(base_name):
+    """Loads a parquet or CSV return file. Raises if neither exists."""
+    for ext in ('parquet', 'csv'):
+        path = f"{base_name}.{ext}"
+        if os.path.exists(path):
+            df = pd.read_parquet(path) if ext == 'parquet' else pd.read_csv(path)
+            print(f"✓ {path}: {len(df):,} rows")
+            return df
+    raise FileNotFoundError(f"Could not find {base_name}.parquet or {base_name}.csv")
+
+
+def _save(rows, base_name):
+    """Saves a list of dicts to parquet or CSV."""
+    if not rows:
+        return None
+    df   = pd.DataFrame(rows)
+    path = f"{base_name}.{FORMAT}"
+    df.to_parquet(path, index=False) if FORMAT == 'parquet' else df.to_csv(path, index=False)
+    return path
+
+
+# =============================================================================
+# SECTION 8 — MAIN
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("STRATEGY ASSEMBLER v2.1  (per-ticker rolling ensemble)")
+    print("=" * 70)
+
+    if not os.path.exists(INPUT_STRATEGIES):
+        raise FileNotFoundError(
+            f"Missing {INPUT_STRATEGIES}. Run the Enricher first.")
+    df_global = pd.read_csv(INPUT_STRATEGIES)
+    print(f"✓ {INPUT_STRATEGIES}: {len(df_global):,} strategies, "
+          f"{df_global['ticker'].nunique()} tickers")
+
+    df_ret   = load_returns(INPUT_RETURNS)
+    col_ret  = 'retorno_oos' if 'retorno_oos' in df_ret.columns else df_ret.columns[-1]
+    df_ret['fecha'] = pd.to_datetime(df_ret['fecha'])
+
+    # Sleeve lookup (sleeve_map.json overrides the CSV column)
+    sleeve_map = {}
+    if os.path.exists(SLEEVE_MAP):
+        with open(SLEEVE_MAP, encoding='utf-8') as f:
+            data = json.load(f)
+        sleeve_map = data.get('ticker_sleeve', data) if isinstance(data, dict) else {}
+
+    INVALID_SLEEVES = {'', 'UNASSIGNED', 'SIN_SLEEVE', 'nan', 'None'}
+
+    def get_sleeve(ticker, row):
+        # Priority: sleeve_map.json > CSV column > fallback
+        sm = sleeve_map.get(ticker)
+        if isinstance(sm, str) and sm.strip() and sm not in INVALID_SLEEVES:
+            return sm
+        s = row.get('sleeve')
+        if isinstance(s, str) and s.strip() and s not in INVALID_SLEEVES:
+            return s
+        return 'SIN_SLEEVE'
+
+    # --- Per-strategy IS returns (for the IS-only pruning) ---
+    # Derived from equity_curves_long (IS segment): equity -> pct_change.
+    is_rets_de = {}
+    try:
+        for ext in ('parquet', 'csv'):
+            p = f"equity_curves_long.{ext}"
+            if os.path.exists(p):
+                _eqc = (pd.read_parquet(p) if ext == 'parquet' else pd.read_csv(p))
+                _eqc = _eqc[_eqc['segmento'] == 'IS']
+                for sid, g in _eqc.groupby('strategy_id'):
+                    g = g.sort_values('fecha')
+                    is_rets_de[sid] = g['equity'].pct_change().fillna(0.0).values
+                break
+        if not is_rets_de:
+            print("⚠  equity_curves_long has no IS segment — pruning falls back "
+                  "to the old OOS criterion (inconsistent with IS-only selection).")
+    except Exception as e:
+        print(f"⚠  Could not load IS curves ({e}) — pruning with old OOS criterion.")
+
+    results, buf_ret, buf_eq, dedup_log = [], [], [], []
+
+    # Sleeves excluded from the portfolio (see Portfolio_Balancer.EXCLUDED_SLEEVES
+    # and the master-sweep evidence). Skipped here to avoid spending compute on
+    # ensembles the balancer would discard anyway. The strategies remain in
+    # top3_global.csv in case the decision is reversed.
+    try:
+        from Portfolio_Balancer import EXCLUDED_SLEEVES
+    except ImportError:
+        EXCLUDED_SLEEVES = set()
+    skipped_by_sleeve = {}
+
+    for ticker, group in df_global.groupby('ticker'):
+        strategy_ids = group['strategy_id'].tolist()
+        asset_group  = group['asset_group'].iloc[0]
+        freq         = annual_freq(asset_group)
+        sleeve       = get_sleeve(ticker, group.iloc[0])
+
+        if sleeve in EXCLUDED_SLEEVES:
+            skipped_by_sleeve[sleeve] = skipped_by_sleeve.get(sleeve, 0) + 1
+            continue
+
+        # Build the strategy return matrix for this ticker
+        sub = df_ret[df_ret['strategy_id'].isin(strategy_ids)]
+        if sub.empty:
+            continue
+        matrix = (sub.pivot_table(index='fecha', columns='strategy_id',
+                                  values=col_ret, aggfunc='mean')
+                     .sort_index()
+                     .fillna(0.0))   # 0 = "in cash" on non-trading days (correct for long-only)
+        if matrix.shape[1] < MIN_STRATEGIES:
+            continue
+
+        # --- Deduplication ---
+        score_map = dict(zip(group['strategy_id'], group.get('selection_score', 0)))
+        n_before  = matrix.shape[1]
+        matrix, eliminated = deduplicate_strategies(matrix, score_map, DEDUP_CORR)
+        n_dedup = n_before - matrix.shape[1]
+
+        # --- Ensemble construction ---
+        avg_sharpe_individual = float(np.mean([sharpe_ratio(matrix[c], freq)
+                                               for c in matrix.columns]))
+        ensemble, winfo = rolling_ensemble(matrix, _WEIGHT_FN[WEIGHTING],
+                                           REBAL_FREQ, LOOKBACK)
+        eq = equity_curve(ensemble)
+
+        # --- Ensemble IS Sharpe (equal-weight; for the IS-only pruning) ---
+        _is_arrays = [is_rets_de[c] for c in matrix.columns if c in is_rets_de]
+        if _is_arrays:
+            _L = min(len(a) for a in _is_arrays)
+            _ens_is = np.mean([a[-_L:] for a in _is_arrays], axis=0)
+            _sd = _ens_is.std()
+            is_sharpe_ens = float(_ens_is.mean() / _sd * np.sqrt(freq)) if _sd > 0 else 0.0
+        else:
+            is_sharpe_ens = np.nan
+
+        # --- Full-period metrics ---
+        ens_sharpe = sharpe_ratio(ensemble, freq)
+        metrics = {
+            'ticker':           ticker,
+            'sleeve':           sleeve,
+            'asset_group':      asset_group,
+            'n_estrategias':    int(matrix.shape[1]),
+            'n_dedup_eliminadas': int(n_dedup),
+            'n_rebalances':     winfo['n_rebalances'],
+            'sharpe':           round(ens_sharpe, 4),
+            'is_sharpe_ens':    round(is_sharpe_ens, 4) if not np.isnan(is_sharpe_ens) else np.nan,
+            'sortino':          round(sortino_ratio(ensemble, freq), 4),
+            'cagr':             round(cagr(eq, freq) * 100, 4),
+            'max_dd':           round(max_drawdown(eq) * 100, 4),
+            'monthly_consistency': round(monthly_consistency(ensemble), 4),
+            'tail_ratio':       round(tail_ratio(ensemble), 4),
+            'vol_anual':        round(float(ensemble.std() * np.sqrt(freq)), 4),
+        }
+
+        # --- Held-out validation (last VAL_DAYS trading days) ---
+        if len(ensemble) > VAL_DAYS + 20:
+            ens_val = ensemble.iloc[-VAL_DAYS:]
+            eq_val  = equity_curve(ens_val)
+            metrics['val_sharpe'] = round(sharpe_ratio(ens_val, freq), 4)
+            metrics['val_dd']     = round(max_drawdown(eq_val) * 100, 4)
+            metrics['val_mc']     = round(monthly_consistency(ens_val), 4)
+        else:
+            metrics['val_sharpe'] = metrics['val_dd'] = metrics['val_mc'] = np.nan
+
+        # --- Ensemble Benefit Ratio (EBR = ensemble Sharpe / avg individual Sharpe) ---
+        ebr = (ens_sharpe / avg_sharpe_individual
+               if avg_sharpe_individual > 0.05 else np.nan)
+        metrics['ensemble_benefit_ratio'] = round(ebr, 4) if not np.isnan(ebr) else np.nan
+
+        # --- Average intra-ensemble correlation ---
+        if matrix.shape[1] >= 2:
+            c = matrix.corr().values.copy()
+            np.fill_diagonal(c, np.nan)
+            intra_corr = float(np.nanmean(np.abs(c)))
+        else:
+            intra_corr = 0.0
+        metrics['intra_corr'] = round(intra_corr, 4)
+
+        # --- Turnover proxy (mean absolute daily change in the ensemble return) ---
+        metrics['turnover_proxy'] = round(float(ensemble.diff().abs().mean()), 6)
+
+        # --- Diversification score (0..1) used by Portfolio_Balancer.py ---
+        # Combines: number of strategies (log-scaled), average decorrelation,
+        # and EBR (how much the ensemble improves on individual strategies).
+        n         = matrix.shape[1]
+        n_score   = min(1.0, np.log(n + 1) / np.log(7))
+        corr_score = 1 - np.clip(intra_corr, 0, 1)
+        ebr_score  = np.clip(((ebr if not np.isnan(ebr) else 1.0) - 0.8) / 0.6, 0, 1)
+        div_score  = 0.40 * n_score + 0.35 * corr_score + 0.25 * ebr_score
+        metrics['diversification_score'] = round(float(div_score), 4)
+
+        results.append(metrics)
+
+        for date, val in ensemble.items():
+            buf_ret.append({'ticker': ticker, 'fecha': date.strftime('%Y-%m-%d'),
+                            'retorno': float(val)})
+        for date, val in eq.round(2).items():
+            buf_eq.append({'ticker': ticker, 'fecha': date.strftime('%Y-%m-%d'),
+                           'equity': float(val)})
+
+        if eliminated:
+            dedup_log.append(
+                f"  {ticker}: {n_dedup} dedup -> " +
+                ", ".join(f"{e[3].split('__')[1]}({e[2]})" for e in eliminated[:5]))
+
+    if not results:
+        print("⚠  No ensembles were built. Check that oos_returns_long exists "
+              "and strategy_ids match top3_global.csv.")
+        return
+
+    # =========================================================================
+    # DEAD-WEIGHT PRUNING — IS criterion (leakage fix)
+    # Pruning prevents inverse-vol from assigning high weight to dead low-vol
+    # ensembles. It USED to prune by ensemble OOS Sharpe — covert OOS
+    # selection one stage after the miner (survivorship bias in validation
+    # metrics). It NOW prunes by ensemble IS Sharpe (is_sharpe_ens,
+    # equal-weight); the OOS is kept for reporting only.
+    # PRUNE_KEEP_MIN prevents leaving any sleeve empty.
+    # =========================================================================
+    df_pre_prune = pd.DataFrame(results)
+    _crit = ('is_sharpe_ens'
+             if df_pre_prune.get('is_sharpe_ens') is not None
+             and df_pre_prune['is_sharpe_ens'].notna().any()
+             else 'sharpe')
+    if _crit != 'is_sharpe_ens':
+        print("⚠  Pruning with OOS criterion (fallback) — equity_curves_long IS missing.")
+    by_sleeve = df_pre_prune.groupby('sleeve')[_crit].apply(
+        lambda x: x.nlargest(PRUNE_KEEP_MIN).index.tolist()
+    ).to_dict()   # index positions to always keep (best per sleeve)
+    must_keep = set()
+    for idxs in by_sleeve.values():
+        must_keep.update(idxs)
+
+    pruned_tickers = set()
+    results_kept = []
+    for r in results:
+        idx = df_pre_prune[df_pre_prune['ticker'] == r['ticker']].index[0]
+        _val = r.get(_crit)
+        if _val is not None and not pd.isna(_val) and _val < PRUNE_SHARPE_MIN \
+                and idx not in must_keep:
+            pruned_tickers.add(r['ticker'])
+        else:
+            results_kept.append(r)
+
+    if pruned_tickers:
+        print(f"✂  Dead-weight pruning: {len(pruned_tickers)} tickers removed "
+              f"(Sharpe < {PRUNE_SHARPE_MIN}): {sorted(pruned_tickers)}")
+        buf_ret = [r for r in buf_ret if r['ticker'] not in pruned_tickers]
+        buf_eq  = [r for r in buf_eq  if r['ticker'] not in pruned_tickers]
+        results = results_kept
+
+    # =========================================================================
+    # SAVE OUTPUTS
+    # =========================================================================
+    df_ens = (pd.DataFrame(results)
+                .sort_values(['sleeve', 'sharpe'], ascending=[True, False]))
+    df_ens.to_csv(OUTPUT_ENSEMBLE, index=False)
+
+    ret_path = _save(buf_ret, OUTPUT_RETURNS)
+    eq_path  = _save(buf_eq,  OUTPUT_EQUITY)
+
+    # -----------------------------------------------------------------------
+    # ensemble_returns_isoos — ensemble returns marked by period (the format
+    # validation.py expects). Derived from equity_curves_long: the IS/OOS
+    # segments come already marked by the miner, and the ensembles are
+    # equal-weight over each ticker's top-3 strategies.
+    # Only non-pruned tickers are written (same criterion as buf_ret/buf_eq).
+    # -----------------------------------------------------------------------
+    isoos_rows = []
+    try:
+        eqc_path = next((f"equity_curves_long.{e}" for e in ('parquet','csv')
+                         if os.path.exists(f"equity_curves_long.{e}")), None)
+        if eqc_path:
+            eqc = (pd.read_parquet(eqc_path) if eqc_path.endswith('parquet')
+                   else pd.read_csv(eqc_path))
+            top3 = pd.read_csv('top3_global.csv')
+            strats_by_ticker = top3.groupby('ticker')['strategy_id'].apply(set).to_dict()
+            survivors = set(df_ens['ticker'])
+            for ticker in survivors:
+                sids = strats_by_ticker.get(ticker, set())
+                if not sids:
+                    continue
+                sub = eqc[eqc['strategy_id'].isin(sids)].copy()
+                if sub.empty:
+                    continue
+                # equity → daily return per strategy; then average (equal-weight)
+                sub = sub.sort_values(['strategy_id', 'fecha'])
+                sub['retorno'] = (sub.groupby('strategy_id')['equity']
+                                     .pct_change().fillna(0.0))
+                # the miner's 'segmento' is IS/OOS -> rename to 'periodo'
+                agg = (sub.groupby(['fecha', 'segmento'])['retorno']
+                          .mean().reset_index()
+                          .rename(columns={'segmento': 'periodo'}))
+                agg['ticker'] = ticker
+                isoos_rows.append(agg[['ticker', 'fecha', 'retorno', 'periodo']])
+            if isoos_rows:
+                df_isoos = pd.concat(isoos_rows, ignore_index=True)
+                if FORMAT == 'parquet':
+                    df_isoos.to_parquet('ensemble_returns_isoos.parquet', index=False)
+                    print(f"✓ ensemble_returns_isoos.parquet: {len(df_isoos):,} rows")
+                else:
+                    df_isoos.to_csv('ensemble_returns_isoos.csv', index=False)
+                    print(f"✓ ensemble_returns_isoos.csv: {len(df_isoos):,} rows")
+        else:
+            print("⚠  equity_curves_long missing — ensemble_returns_isoos not generated.")
+    except Exception as e:
+        print(f"⚠  ensemble_returns_isoos not generated: {e}")
+
+
+    # =========================================================================
+    # REPORT
+    # =========================================================================
+    L = ["=" * 70, "STRATEGY ASSEMBLER v2.1 — REPORT", "=" * 70,
+         f"\nMethod: {WEIGHTING} (rolling, rebal every {REBAL_FREQ}d, "
+         f"lookback {LOOKBACK}d)",
+         f"Ensembles built: {len(df_ens)}  "
+         f"(pruned: {len(pruned_tickers)}, threshold Sharpe < {PRUNE_SHARPE_MIN})", ""]
+
+    if skipped_by_sleeve:
+        L.append("Sleeves excluded from portfolio (see Portfolio_Balancer.EXCLUDED_SLEEVES):")
+        for s, n in sorted(skipped_by_sleeve.items()):
+            L.append(f"  {s}: {n} tickers skipped")
+        L.append("")
+
+    L.append("By sleeve:")
+    for sleeve, g in df_ens.groupby('sleeve'):
+        ebr_vals = g['ensemble_benefit_ratio'].dropna()
+        L.append(f"  {sleeve:20s} n={len(g):3d}  "
+                 f"Sharpe={g['sharpe'].mean():.2f}  "
+                 f"DD={g['max_dd'].mean():.1f}%  "
+                 f"MC={g['monthly_consistency'].mean():.2f}  "
+                 f"EBR={ebr_vals.mean() if len(ebr_vals) else 0:.2f}  "
+                 f"div={g['diversification_score'].mean():.2f}")
+
+    ebr_all = df_ens['ensemble_benefit_ratio'].dropna()
+    if len(ebr_all):
+        below = int((ebr_all < 1.0).sum())
+        L += ["", "Ensemble Benefit Ratio:",
+              f"  mean={ebr_all.mean():.2f}  median={ebr_all.median():.2f}  "
+              f"EBR<1 (no benefit): {below}/{len(ebr_all)}"]
+
+    fragile = df_ens[df_ens['n_estrategias'] == 1]
+    if len(fragile):
+        L += ["", f"⚠  {len(fragile)} tickers with only 1 strategy (fragile): " +
+              ", ".join(fragile['ticker'].head(15).tolist())]
+
+    if 'val_sharpe' in df_ens.columns:
+        vs = df_ens['val_sharpe'].dropna()
+        if len(vs):
+            gap = df_ens['sharpe'].mean() - vs.mean()
+            flag = "  ⚠ possible overfitting" if gap > 0.3 else "  ✅ consistent"
+            L += ["", f"Sharpe OOS avg={df_ens['sharpe'].mean():.2f}  "
+                      f"val avg={vs.mean():.2f}  gap={gap:.2f}" + flag]
+
+    L += ["", "Top 10 by Sharpe:"]
+    for _, row in df_ens.nlargest(10, 'sharpe').iterrows():
+        L.append(f"  {row['ticker']:10s} {row['sleeve']:18s} "
+                 f"Sharpe={row['sharpe']:.2f} "
+                 f"DD={row['max_dd']:.1f}% "
+                 f"n={row['n_estrategias']} "
+                 f"div={row['diversification_score']:.2f}")
+
+    if dedup_log:
+        L += ["", "Cross-indicator deduplication:"] + dedup_log[:20]
+
+    with open(OUTPUT_REPORT, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(L))
+
+    print("\n" + "=" * 70)
+    print("✅ ASSEMBLER COMPLETE")
+    print("=" * 70)
+    print(f"  Ensembles:        {len(df_ens)}")
+    print(f"  Dedup removed:    {df_ens['n_dedup_eliminadas'].sum()}")
+    print(f"  Ensemble CSV:     {OUTPUT_ENSEMBLE}")
+    print(f"  Returns (long):   {ret_path}")
+    print(f"  Equity curves:    {eq_path}")
+    print(f"  Report:           {OUTPUT_REPORT}")
+    print(f"\n  Next step: py Portfolio_Balancer.py\n")
+
+
+if __name__ == '__main__':
+    main()

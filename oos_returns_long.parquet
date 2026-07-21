@@ -1,0 +1,69 @@
+"""
+generar_chart.py — Regenera results/portfolio_equity_chart.png (equity,
+drawdown y curvas por sleeve) a partir de los parquets que deja
+Portfolio_Balancer.py. Standalone porque el notebook no trae celda de
+ploteo (se perdio en una consolidacion anterior — ver auditoria 2026-07).
+
+Uso: py generar_chart.py
+"""
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+
+eq = pd.read_parquet('portfolio_equity.parquet')
+eq['fecha'] = pd.to_datetime(eq['fecha'])
+sleeves = pd.read_parquet('sleeve_equity_curves.parquet')
+sleeves['fecha'] = pd.to_datetime(sleeves['fecha'])
+
+fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=False,
+                          gridspec_kw={'height_ratios': [2, 1, 1.3]})
+
+# --- Panel 1: equity oficial vs sin costos ---
+ax = axes[0]
+ax.plot(eq['fecha'], eq['equity'], label='Official (with costs)',
+        color='#1f77b4', linewidth=1.4)
+ax.plot(eq['fecha'], eq['baseline_equity'], label='No costs (reference)',
+        color='#aaaaaa', linewidth=1.0, linestyle='--')
+ax.set_title('Portfolio Equity — Official vs No-Costs Reference', fontsize=12)
+ax.set_ylabel('Equity ($)')
+ax.legend(loc='upper left', fontsize=9)
+ax.grid(alpha=0.3)
+
+# --- Panel 2: drawdown (columna ya viene en % -- min == MaxDD del reporte) ---
+ax = axes[1]
+ax.fill_between(eq['fecha'], eq['drawdown'], 0,
+                 color='#d62728', alpha=0.4)
+ax.plot(eq['fecha'], eq['drawdown'], color='#d62728', linewidth=0.8)
+ax.set_title('Drawdown (Official)', fontsize=12)
+ax.set_ylabel('Drawdown (%)')
+ax.grid(alpha=0.3)
+
+# --- Panel 3: curvas por sleeve, normalizadas a 100 en su propio inicio ---
+ax = axes[2]
+colors = {'GROWTH_BETA': '#2ca02c', 'DIVERSIFIERS': '#9467bd',
+          'CYCLICAL_COMMODITY': '#ff7f0e', 'CRYPTO': '#e377c2'}
+for sleeve, g in sleeves.groupby('sleeve'):
+    if sleeve == 'DEFENSIVE_QUALITY':
+        continue
+    g = g.sort_values('fecha')
+    norm = g['equity'] / g['equity'].iloc[0] * 100
+    ax.plot(g['fecha'], norm, label=sleeve, linewidth=1.2,
+            color=colors.get(sleeve))
+ax.set_title('Sleeve Equity Curves (normalized, base=100)', fontsize=12)
+ax.set_ylabel('Index (base 100)')
+ax.legend(loc='upper left', fontsize=8, ncol=2)
+ax.grid(alpha=0.3)
+
+for ax in axes:
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+fig.suptitle('Quant Trend-Following Pipeline — Official Portfolio', fontsize=14, y=0.995)
+fig.tight_layout(rect=[0, 0, 1, 0.98])
+
+import os
+os.makedirs('results', exist_ok=True)
+fig.savefig('results/portfolio_equity_chart.png', dpi=140)
+print('OK -> results/portfolio_equity_chart.png')

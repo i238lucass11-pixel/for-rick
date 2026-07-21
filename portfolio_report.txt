@@ -1,0 +1,22 @@
+======================================================================
+VALIDATION REPORT — LAYER 3: MONTE CARLO (block bootstrap)
+======================================================================
+
+Simulations: 2,000  |  ~21-day blocks (preserve clustering)
+Period: from 2019-01-01 (complete universe)
+
+METRIC DISTRIBUTIONS (percentiles over alternative histories):
+  Sharpe  : p5     0.61  median     1.25  p95     1.93   | real     1.26 (pct 51)
+  Calmar  : p5     0.30  median     0.91  p95     2.03   | real     0.96 (pct 53)
+  CAGR    : p5    3.87%  median    8.35%  p95   13.28%   | real    8.42% (pct 51)
+  MaxDD   : p5  -15.18%  median   -9.07%  p95   -5.73%   | real   -8.78% (pct 55)
+
+INTERPRETATION:
+  🔶 In the worst 5%, Sharpe drops to 0.61 (acceptable but not
+     brilliant). The ordering of events matters somewhat.
+  The drawdown in the worst 5% of histories reaches -15.2%
+  (plan for THAT drawdown, not the historical one — the worst can repeat).
+
+  Note: block bootstrap assumes returns are 'exchangeable' in blocks.
+  It does not capture structural regime changes (a new, different 2022).
+  It is a test of robustness to ordering, not a crystal ball.

@@ -1,0 +1,53 @@
+======================================================================
+STRATEGY ASSEMBLER v2.1 — REPORT
+======================================================================
+
+Method: inv_vol (rolling, rebal every 63d, lookback 126d)
+Ensembles built: 278  (pruned: 3, threshold Sharpe < 0.4)
+
+By sleeve:
+  CRYPTO               n= 32  Sharpe=0.19  DD=-53.1%  MC=0.29  EBR=1.05  div=0.53
+  CYCLICAL_COMMODITY   n= 88  Sharpe=0.34  DD=-35.5%  MC=0.41  EBR=1.08  div=0.51
+  DIVERSIFIERS         n= 29  Sharpe=1.58  DD=-10.4%  MC=0.65  EBR=1.06  div=0.42
+  GROWTH_BETA          n=129  Sharpe=0.46  DD=-31.0%  MC=0.44  EBR=1.08  div=0.55
+
+Ensemble Benefit Ratio:
+  mean=1.07  median=1.06  EBR<1 (no benefit): 27/228
+
+⚠  62 tickers with only 1 strategy (fragile): HBAR-USD, ETH-USD, BKCH, DOGE-USD, BNB-USD, BTC-USD, LINK-USD, BCH-USD, ICP-USD, MANA-USD, OP-USD, BLOK, MATIC-USD, RB=F, OJ=F
+
+Sharpe OOS avg=0.51  val avg=0.43  gap=0.08  ✅ consistent
+
+Top 10 by Sharpe:
+  CADJPY=X   DIVERSIFIERS       Sharpe=2.57 DD=-3.3% n=2 div=0.46
+  EURJPY=X   DIVERSIFIERS       Sharpe=2.49 DD=-3.3% n=2 div=0.42
+  GBPJPY=X   DIVERSIFIERS       Sharpe=2.33 DD=-2.9% n=2 div=0.42
+  AUDNZD=X   DIVERSIFIERS       Sharpe=2.28 DD=-2.4% n=2 div=0.36
+  NZDJPY=X   DIVERSIFIERS       Sharpe=2.20 DD=-6.6% n=2 div=0.38
+  AUDJPY=X   DIVERSIFIERS       Sharpe=2.16 DD=-4.7% n=2 div=0.37
+  GBPCAD=X   DIVERSIFIERS       Sharpe=2.15 DD=-2.3% n=2 div=0.38
+  CHAT       GROWTH_BETA        Sharpe=2.10 DD=-14.4% n=3 div=0.71
+  GBPUSD=X   DIVERSIFIERS       Sharpe=2.00 DD=-3.5% n=2 div=0.42
+  NZDUSD=X   DIVERSIFIERS       Sharpe=1.99 DD=-3.4% n=2 div=0.39
+
+Cross-indicator deduplication:
+  ABNB: 1 dedup -> MACD(0.946)
+  AMD: 1 dedup -> MACD(0.904)
+  BIZD: 1 dedup -> TEMA(0.946)
+  BUG: 1 dedup -> CCI(0.926)
+  HD: 1 dedup -> MACD(0.95)
+  HEDJ: 1 dedup -> CHANDELIER(0.962)
+  ICLN: 1 dedup -> MACD(0.961)
+  IDRV: 1 dedup -> TEMA(0.909)
+  IPGP: 1 dedup -> BBANDS(0.981)
+  IREN: 1 dedup -> BBANDS(0.913)
+  LIT: 1 dedup -> CHANDELIER(0.94)
+  MAR: 1 dedup -> CHANDELIER(1.0)
+  MCHI: 1 dedup -> KAMA(0.928)
+  NRG: 1 dedup -> TEMA(0.997)
+  OP-USD: 1 dedup -> CHANDELIER(0.996)
+  PAVE: 1 dedup -> CCI(0.928)
+  PLTR: 1 dedup -> ADX(0.912)
+  QTUM: 1 dedup -> CHANDELIER(0.999)
+  SEA: 1 dedup -> TEMA(0.916)
+  TRFK: 1 dedup -> MACD(0.906)

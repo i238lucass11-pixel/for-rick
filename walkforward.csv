@@ -1,0 +1,50 @@
+======================================================================
+PORTFOLIO BALANCER — REPORT
+======================================================================
+
+Period: 2016-05-25 → 2026-07-20  (10.4 years)
+Capital: $10,000 → $20,248
+
+PERFORMANCE (no-cost reference vs official portfolio):
+  No costs : CAGR   7.94%  Sharpe  1.11  Vol  7.15%  MaxDD -14.23%  Calmar 0.56
+  Official : CAGR   7.03%  Sharpe  1.03  Vol  6.85%  MaxDD -12.09%  Calmar 0.58
+
+Allocation: inverse-vol across sleeves (capped) × diversification score within sleeves
+Leverage: OFF (max 1.00x)  [tested 1.15-1.50x: monotonically worse]
+Regime: risk-on 81% / risk-off 14% of days (informational)
+Gross exposure: mean 0.99x  (max 1.00x, min 0.70x)
+VIX de-risk gate: ON (floor 70%)  days with exposure < 95%: 83
+Vol estimator: ewma (λ=0.94)   Realized vol: mean 6.5%  max 27.0%
+Transaction costs: ON  turnover 0.25% over 21 rebalances  (drag ~0.02%/yr)
+Swap/financing (Vantage CFD holding): total 7.89% of capital  (drag ~0.76%/yr)
+Broker allocation: BINANCE:27  EXCLUDED:1  HAPI:205  VANTAGE:45
+Excluded (not on Hapi, INCLUDE_NON_HAPI_AS_CFD=False): 1 tickers
+
+SLEEVE TREND SCORES (last rebalance, 0=bear 1=bull, informational):
+  CYCLICAL_COMMODITY     0.69 🔥
+  DIVERSIFIERS           0.69   
+  GROWTH_BETA            0.50   
+  CRYPTO                 0.15 ❄️
+
+SLEEVE WEIGHTS (last rebalance):
+  CYCLICAL_COMMODITY      30.0% (cap 30%)
+  DIVERSIFIERS            30.0% (cap 30%)
+  GROWTH_BETA             27.2% (cap 80%)
+  CRYPTO                  12.8% (cap 25%)
+
+TOP 15 POSITIONS (final weight):
+  SI=F       DIVERSIFIERS          1.42%
+  USDNOK=X   DIVERSIFIERS          1.26%
+  GC=F       DIVERSIFIERS          1.20%
+  CADJPY=X   DIVERSIFIERS          1.13%
+  SIL        DIVERSIFIERS          1.11%
+  AUDCAD=X   DIVERSIFIERS          1.10%
+  NZDCAD=X   DIVERSIFIERS          1.08%
+  AUDUSD=X   DIVERSIFIERS          1.06%
+  EURGBP=X   DIVERSIFIERS          1.06%
+  USDSEK=X   DIVERSIFIERS          1.05%
+  EURNZD=X   DIVERSIFIERS          1.04%
+  GBPJPY=X   DIVERSIFIERS          1.04%
+  EURJPY=X   DIVERSIFIERS          1.04%
+  USDCHF=X   DIVERSIFIERS          1.03%
+  GBPUSD=X   DIVERSIFIERS          1.03%
